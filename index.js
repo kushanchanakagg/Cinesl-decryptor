@@ -14,6 +14,66 @@ import {
 const app = new Hono();
 const PORT = process.env.PORT || 3030;
 
+function firstHeaderValue(value) {
+  return String(value || '').split(',')[0].trim();
+}
+
+// Public origin of the request as the *browser* sees it.
+//
+// Reverse proxies (Bot-Hosting, Render, Fly, nginx, Caddy…) terminate TLS and
+// forward plain HTTP, so `c.req.url` is `http://…` even though the page is on
+// `https://…`. Building proxy URLs from that origin makes the player XHR
+// `http://…/proxy` from an https page, which browsers block as mixed content.
+export function publicOrigin(c) {
+  const url = new URL(c.req.url);
+
+  const forwarded = c.req.header('forwarded') || '';
+  const fProto = /(?:^|;)\s*proto=("?)([^;"]+)\1/i.exec(forwarded)?.[2];
+  const fHost = /(?:^|;)\s*host=("?)([^;"]+)\1/i.exec(forwarded)?.[2];
+
+  // The page that calls us knows the real scheme/host even when the proxy
+  // forgets to forward it (fetch POSTs always carry Origin; sub-resource XHR
+  // carries Referer).
+  let browserUrl;
+  try {
+    browserUrl = new URL(
+      firstHeaderValue(c.req.header('origin')) ||
+        firstHeaderValue(c.req.header('referer')) ||
+        ''
+    );
+  } catch {
+    browserUrl = undefined;
+  }
+
+  const proto =
+    firstHeaderValue(c.req.header('x-forwarded-proto')) ||
+    fProto ||
+    browserUrl?.protocol.replace(':', '') ||
+    '';
+
+  const host =
+    firstHeaderValue(c.req.header('x-forwarded-host')) ||
+    fHost ||
+    browserUrl?.host ||
+    firstHeaderValue(c.req.header('host'));
+
+  if (proto === 'https' || proto === 'http') url.protocol = proto + ':';
+
+  if (host) {
+    // Set hostname and port separately: assigning `.host` keeps the old port
+    // when the forwarded host has none (e.g. ...:3030 → https://host:3030).
+    try {
+      const parsed = new URL(`${url.protocol}//${host}`);
+      url.hostname = parsed.hostname;
+      url.port = parsed.port;
+    } catch {
+      /* ignore malformed forwarded host */
+    }
+  }
+
+  return url.origin;
+}
+
 app.post('/api/extract', async (c) => {
   let body;
   try {
@@ -31,7 +91,7 @@ app.post('/api/extract', async (c) => {
       ? 'https://www.themoviedb.org/movie/' + url.trim()
       : url;
     const result = await extract(target);
-    const proxyBase = new URL(c.req.url).origin;
+    const proxyBase = publicOrigin(c);
     const proxyUrl = encodeProxyUrl(result.m3u8, result.referer, proxyBase, result.headers);
 
     const servers = Array.isArray(result.servers)
@@ -39,6 +99,9 @@ app.post('/api/extract', async (c) => {
           name: s.name,
           type: s.type,
           quality: s.quality || '',
+          // true/false/null from the reachability probe; absent for extractors
+          // that don't probe.
+          ...(s.ok === undefined ? {} : { ok: s.ok }),
           proxyUrl: encodeProxyUrl(s.url, s.referer, proxyBase, s.headers),
         }))
       : undefined;
@@ -84,13 +147,24 @@ app.get('/proxy', async (c) => {
     if (isPlaylistTarget(target, contentType)) {
       const text = await res.text();
       if (!isPlaylist(text, contentType)) {
+        console.warn(
+          '[proxy] non-playlist upstream:',
+          new URL(target).hostname,
+          res.status,
+          contentType,
+          JSON.stringify(text.slice(0, 160))
+        );
         return new Response(
-          'Upstream returned a non-playlist response (block page or error). Try another server.',
+          `Upstream returned HTTP ${res.status}${
+            contentType ? ' ' + contentType : ''
+          } instead of a playlist (block page or dead source). Try another server.`,
           { status: 502, headers: { 'content-type': 'text/plain', 'access-control-allow-origin': '*' } }
         );
       }
-      const proxyBase = new URL(c.req.url).origin;
-      const rewritten = rewritePlaylist(text, target, referer, proxyBase);
+      // Root-relative links (`/proxy?...`): hls.js resolves them against this
+      // response's URL, so they always inherit the correct scheme (no mixed
+      // content behind a TLS-terminating proxy).
+      const rewritten = rewritePlaylist(text, target, referer, '', extraHeaders);
       return new Response(rewritten, {
         status: 200,
         headers: {
