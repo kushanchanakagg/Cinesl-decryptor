@@ -9,6 +9,7 @@ import {
   fetchThrough,
   needsDeprefix,
   stripFakePrefix,
+  setRelayConfig,
 } from './src/proxy.js';
 
 const app = new Hono();
@@ -87,6 +88,8 @@ app.post('/api/extract', async (c) => {
   }
 
   try {
+    setRelayConfig(c.env);
+
     const target = /^\d+$/.test(url.trim())
       ? 'https://www.themoviedb.org/movie/' + url.trim()
       : url;
@@ -129,6 +132,8 @@ app.get('/proxy', async (c) => {
   }
 
   try {
+    setRelayConfig(c.env);
+
     const deprefix = needsDeprefix(target);
     const useReferer = referer && !deprefix;
 

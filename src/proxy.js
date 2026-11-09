@@ -12,6 +12,69 @@ const EXTRA_HEADER_ALLOWLIST = new Set([
   'sec-fetch-site',
 ]);
 
+// Optional outbound relay (relay/relay.php). Some CDNs answer 403 to
+// Cloudflare Worker egress but 200 to an ordinary hosting IP; routing only
+// those hosts through the relay keeps everything else direct.
+let RELAY = null;
+
+function envValue(env, name) {
+  if (env && env[name]) return String(env[name]).trim();
+  if (typeof process !== 'undefined' && process.env && process.env[name]) {
+    return String(process.env[name]).trim();
+  }
+  return '';
+}
+
+export function setRelayConfig(env) {
+  const url = envValue(env, 'PROXY_RELAY_URL');
+
+  if (!url) {
+    RELAY = null;
+    return null;
+  }
+
+  const hosts = envValue(env, 'PROXY_RELAY_HOSTS')
+    .split(',')
+    .map((h) => h.trim().toLowerCase().replace(/^\./, ''))
+    .filter(Boolean);
+
+  RELAY = { url, key: envValue(env, 'PROXY_RELAY_KEY'), hosts };
+
+  return RELAY;
+}
+
+export function getRelayConfig() {
+  return RELAY;
+}
+
+// Returns { url, headers } when the target should go through the relay.
+export function relayTarget(target) {
+  if (!RELAY) return null;
+
+  let host;
+
+  try {
+    host = new URL(target).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+
+  if (
+    RELAY.hosts.length &&
+    !RELAY.hosts.some((h) => host === h || host.endsWith('.' + h))
+  ) {
+    return null;
+  }
+
+  const u = new URL(RELAY.url);
+  u.searchParams.set('url', target);
+
+  return {
+    url: u.toString(),
+    headers: RELAY.key ? { 'x-relay-key': RELAY.key } : {},
+  };
+}
+
 export function encodeExtraHeaders(obj) {
   if (!obj || typeof obj !== 'object') return null;
   const clean = {};
@@ -41,12 +104,16 @@ export function decodeExtraHeaders(token) {
 }
 
 export function encodeProxyUrl(target, referer, proxyBase, extra) {
-  const u = new URL('/proxy', proxyBase);
-  u.searchParams.set('url', target);
-  if (referer) u.searchParams.set('referer', referer);
+  const params = new URLSearchParams();
+  params.set('url', target);
+  if (referer) params.set('referer', referer);
   const h = encodeExtraHeaders(extra);
-  if (h) u.searchParams.set('headers', h);
-  return u.toString();
+  if (h) params.set('headers', h);
+  const path = `/proxy?${params}`;
+  // No base ⇒ root-relative link, which hls.js resolves against the playlist
+  // URL we served. Used for playlist rewriting so a TLS-terminating reverse
+  // proxy can never turn the links into http:// (mixed content).
+  return proxyBase ? new URL(path, proxyBase).toString() : path;
 }
 
 function isM3u8ContentType(contentType) {
@@ -67,7 +134,7 @@ export function isPlaylistTarget(target, contentType) {
   }
 }
 
-export function rewritePlaylist(playlistText, baseUrl, referer, proxyBase) {
+export function rewritePlaylist(playlistText, baseUrl, referer, proxyBase, extra) {
   const base = new URL('.', baseUrl);
   return playlistText
     .split('\n')
@@ -77,12 +144,12 @@ export function rewritePlaylist(playlistText, baseUrl, referer, proxyBase) {
       if (/^#EXT-X-(MAP|KEY|MEDIA):/i.test(trimmed)) {
         return line.replace(/(URI=")([^"]+)(")/g, (_m, pre, uri, post) => {
           const abs = resolve(uri, base);
-          return pre + encodeProxyUrl(abs, referer, proxyBase) + post;
+          return pre + encodeProxyUrl(abs, referer, proxyBase, extra) + post;
         });
       }
       if (trimmed.startsWith('#')) return line;
       const abs = resolve(trimmed, base);
-      return encodeProxyUrl(abs, referer, proxyBase);
+      return encodeProxyUrl(abs, referer, proxyBase, extra);
     })
     .join('\n');
 }
@@ -131,18 +198,42 @@ export function stripFakePrefix(buf) {
 
 export async function fetchThrough(target, referer, { range, origin, useReferer, extraHeaders, signal } = {}) {
   if (useReferer === undefined) {
-    useReferer = referer && !shouldDropReferer(target);
+    useReferer = Boolean(referer) && !shouldDropReferer(target);
   }
+
+  // Lower-case names throughout: `Origin` and `origin` are the same header on
+  // the wire, and sending both (referer-derived + explicit) makes undici/Workers
+  // merge them into `https://a, https://b` — which CDNs answer 403 to.
   const headers = {
-    'User-Agent': UA,
-    Accept: '*/*',
-    ...(useReferer ? { Referer: referer, Origin: referer } : {}),
-    ...(origin ? { Origin: origin } : {}),
-    ...(extraHeaders || {}),
-    ...(range ? { Range: range } : {}),
+    'user-agent': UA,
+    accept: '*/*',
   };
 
-  const res = await fetch(target, { redirect: 'follow', headers, signal });
+  if (useReferer) {
+    headers.referer = referer;
+    headers.origin = referer;
+  }
+
+  if (origin) headers.origin = origin;
+
+  for (const [key, value] of Object.entries(extraHeaders || {})) {
+    if (typeof value !== 'string' || !value) continue;
+    headers[key.toLowerCase()] = value;
+  }
+
+  if (range) headers.range = range;
+
+  const relay = relayTarget(target);
+
+  if (relay) {
+    Object.assign(headers, relay.headers);
+  }
+
+  const res = await fetch(relay ? relay.url : target, {
+    redirect: 'follow',
+    headers,
+    signal,
+  });
 
   return {
     res,

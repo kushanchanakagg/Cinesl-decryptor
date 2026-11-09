@@ -2,6 +2,7 @@
 import CryptoJS from 'crypto-js';
 import { UA } from './../http.js';
 import { base64ToB64url, b64urlToBase64 } from './../util.js';
+import { relayTarget } from './../proxy.js';
 
 const API_BASE = 'https://web.nxsha.app';
 const NX_ORIGIN = 'https://web.nxsha.app';
@@ -25,6 +26,26 @@ const VERIFY_LIMIT = 10;
 const VERIFY_CONCURRENCY = 4;
 const VERIFY_TIMEOUT = 6000;
 
+// nxsha sits behind Cloudflare and intermittently answers /api/servers with
+// 403 (WAF/rate-limit after a burst) even for a valid encrypted payload. The
+// same request succeeds moments later, so retry with backoff instead of
+// failing the whole extraction (and losing the server list to vixsrc).
+const API_RETRIES = 2;
+const RETRY_BASE_MS = 500;
+const RETRYABLE_STATUS = new Set([403, 408, 425, 429, 500, 502, 503, 504]);
+
+// Tried in order on retries: full browser-ish headers, then bare, then JSON.
+const API_HEADER_PROFILES = [
+  {
+    'User-Agent': UA,
+    Accept: '*/*',
+    Referer: NX_REFERER,
+    Origin: NX_ORIGIN,
+  },
+  { 'User-Agent': UA, Accept: '*/*' },
+  { 'User-Agent': UA, Accept: 'application/json' },
+];
+
 // Sources that need a browser session / private cookie we can't supply.
 const UNSUPPORTED_SCRAPERS = new Set(['showbox-online']);
 
@@ -37,6 +58,27 @@ function log(...args) {
 
 function warn(...args) {
   console.warn(TAG, ...args);
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
 }
 
 function encodeData(obj) {
@@ -248,17 +290,55 @@ function parseInput(input) {
 }
 
 async function apiGet(path, query, signal) {
+  let lastErr;
+
+  for (let attempt = 0; attempt <= API_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const wait = RETRY_BASE_MS * 2 ** (attempt - 1) + Math.random() * 250;
+
+      log(path, `retry ${attempt}/${API_RETRIES} in ${Math.round(wait)}ms`);
+
+      await sleep(wait, signal);
+    }
+
+    const headers =
+      API_HEADER_PROFILES[attempt % API_HEADER_PROFILES.length];
+
+    try {
+      return await apiGetOnce(path, query, signal, headers);
+    } catch (err) {
+      lastErr = err;
+
+      const aborted =
+        signal?.aborted ||
+        err?.name === 'AbortError' ||
+        err?.name === 'TimeoutError';
+
+      if (aborted) throw err;
+
+      // Parse/decrypt failures aren't transient — retrying just re-hits the
+      // API with the same (already key-refreshed) payload.
+      if (err?.retryable === false) throw err;
+
+      if (err?.status !== undefined && !RETRYABLE_STATUS.has(err.status)) {
+        throw err;
+      }
+
+      warn(path, 'attempt', attempt + 1, 'failed:', err?.message || err);
+    }
+  }
+
+  throw lastErr;
+}
+
+async function apiGetOnce(path, query, signal, headers) {
   const url = `${API_BASE}${path}?q=${encodeURIComponent(query)}`;
 
   log('Request:', path);
 
   const res = await fetch(url, {
     signal,
-    headers: {
-      'User-Agent': UA,
-      Accept: '*/*',
-      Referer: API_BASE + '/',
-    },
+    headers,
   });
 
   log(path, 'HTTP:', res.status);
@@ -266,9 +346,13 @@ async function apiGet(path, query, signal) {
   const raw = await res.text();
 
   if (!res.ok) {
-    throw new Error(
+    const err = new Error(
       `${path} HTTP ${res.status}: ${raw.slice(0, 300)}`
     );
+
+    err.status = res.status;
+
+    throw err;
   }
 
   let json;
@@ -276,15 +360,23 @@ async function apiGet(path, query, signal) {
   try {
     json = JSON.parse(raw);
   } catch {
-    throw new Error(`${path}: Invalid JSON response`);
+    const err = new Error(`${path}: Invalid JSON response`);
+
+    err.retryable = false;
+
+    throw err;
   }
 
   if (!json || !json._hash) {
-    throw new Error(
+    const err = new Error(
       `${path}: Missing _hash. Response keys: ${
         Object.keys(json || {}).join(', ')
       }`
     );
+
+    err.retryable = false;
+
+    throw err;
   }
 
   let decoded;
@@ -296,7 +388,10 @@ async function apiGet(path, query, signal) {
 
     const fresh = await refreshKeyThrottled();
 
-    if (!fresh) throw err;
+    if (!fresh) {
+      err.retryable = false;
+      throw err;
+    }
 
     decoded = decodeData(json._hash);
   }
@@ -349,37 +444,49 @@ function buildProxyParts(chosen) {
 }
 
 // Cheap reachability probe used to order servers. Returns:
-//   true  – playlist/media fetched (or at least a 2xx for mp4)
+//   true  – playlist/media fetched
 //   false – definitive upstream refusal (4xx/5xx, block page)
 //   null  – timeout / transport error (unknown; don't blacklist)
 async function probeSource(entry) {
   const headers = {
     'User-Agent': UA,
     Accept: '*/*',
+    // Range keeps mp4/mkv probes from pulling the whole file and makes CDNs
+    // answer with headers immediately (200 for text, 206 for media).
+    Range: 'bytes=0-1023',
     Referer: entry.referer || NX_REFERER,
     Origin: (entry.headers && entry.headers.origin) || NX_ORIGIN,
   };
 
+  const drop = (res) => res.body?.cancel?.().catch(() => {});
+
   try {
-    const res = await fetch(entry.url, {
-      headers,
+    // If this host is relay-routed, probe through the relay too — otherwise
+    // relay-only sources would be ranked as "failed" and pushed to the bottom.
+    const relay = relayTarget(entry.url);
+
+    const res = await fetch(relay ? relay.url : entry.url, {
+      headers: relay ? { ...headers, ...relay.headers } : headers,
       redirect: 'follow',
       signal: AbortSignal.timeout(VERIFY_TIMEOUT),
     });
 
-    if (!res.ok) {
-      await res.body?.cancel?.().catch(() => {});
+    if (res.status !== 200 && res.status !== 206) {
+      await drop(res);
       return false;
     }
 
-    if (entry.type === 'mp4' || /mpegurl/i.test(res.headers.get('content-type') || '')) {
-      await res.body?.cancel?.().catch(() => {});
+    if (entry.type === 'mp4') {
+      await drop(res);
       return true;
     }
 
     const reader = res.body?.getReader();
 
-    if (!reader) return null;
+    if (!reader) {
+      await drop(res);
+      return /mpegurl/i.test(res.headers.get('content-type') || '') || res.ok;
+    }
 
     const { value } = await reader.read();
 
@@ -391,7 +498,9 @@ async function probeSource(entry) {
 
     const head = value ? new TextDecoder().decode(value.subarray(0, 512)) : '';
 
-    return /^#EXTM3U/i.test(head.trim()) ? true : false;
+    if (/^#EXTM3U/i.test(head.trim())) return true;
+
+    return /mpegurl/i.test(res.headers.get('content-type') || '');
   } catch {
     return null;
   }
